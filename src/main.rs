@@ -3,12 +3,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -230,7 +231,24 @@ struct Choice {
     message: ChatMessage,
 }
 
-#[derive(Debug)]
+struct AtomicStats {
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+    tasks: AtomicUsize,
+    errors: AtomicUsize,
+}
+
+impl AtomicStats {
+    fn new() -> Self {
+        Self {
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
+            tasks: AtomicUsize::new(0),
+            errors: AtomicUsize::new(0),
+        }
+    }
+}
+
 struct RunStats {
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -615,12 +633,7 @@ async fn main() -> Result<()> {
     let proxy_counter = Arc::new(AtomicUsize::new(0));
 
     let file = Arc::new(std::sync::Mutex::new(file));
-    let stats = Arc::new(std::sync::Mutex::new(RunStats {
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        total_tasks: 0,
-        errors: 0,
-    }));
+    let stats = Arc::new(AtomicStats::new());
 
     let budget = args.budget;
     let input_price = args.input_price;
@@ -628,11 +641,29 @@ async fn main() -> Result<()> {
     let count = args.count;
     let workers = args.workers;
 
-    println!("Generating {} tasks with {} workers...", count, workers);
-    println!("Model: {} | Temperature: {}", args.model, args.temperature);
+    // pre-sample all domain/difficulty pairs to avoid RNG contention in workers
+    let mut rng = thread_rng();
+    let presampled: Vec<(String, String, String, u8)> = (0..count)
+        .map(|_| {
+            let (cat, name, sub) = sample_domain(&mut rng, &pool);
+            let diff = sample_difficulty(&mut rng, &diff_dist);
+            (cat, name, sub, diff)
+        })
+        .collect();
 
-    let results: Vec<_> = stream::iter(0..count)
-        .map(|i| {
+    let presampled = Arc::new(presampled);
+
+    let pb = ProgressBar::new(count as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) | {msg}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    pb.set_message("starting...");
+
+    stream::iter(0..count)
+        .for_each_concurrent(workers, |i| {
             let clients = clients.clone();
             let proxy_counter = proxy_counter.clone();
             let file = file.clone();
@@ -642,26 +673,20 @@ async fn main() -> Result<()> {
             let key_counter = key_counter.clone();
             let model = args.model.clone();
             let system_prompt = system_prompt.to_string();
-            let pool = pool.clone();
-            let diff_dist = diff_dist.clone();
+            let presampled = presampled.clone();
             let temperature = args.temperature;
-            let budget = budget;
-            let input_price = input_price;
-            let output_price = output_price;
+            let pb = pb.clone();
 
             async move {
-                let mut rng = thread_rng();
-                let (cat, domain_name, subdomain) = sample_domain(&mut rng, &pool);
-                let difficulty = sample_difficulty(&mut rng, &diff_dist);
+                let (ref cat, ref domain_name, ref subdomain, difficulty) = presampled[i];
 
-                {
-                    let s = stats.lock().unwrap();
-                    if let (Some(b), Some(ip), Some(op)) = (budget, input_price, output_price) {
-                        let cost = (ip * s.total_input_tokens as f64 / 1_000_000.0)
-                            + (op * s.total_output_tokens as f64 / 1_000_000.0);
-                        if cost >= b {
-                            return;
-                        }
+                if let (Some(b), Some(ip), Some(op)) = (budget, input_price, output_price) {
+                    let in_tok = stats.input_tokens.load(Ordering::Relaxed) as f64;
+                    let out_tok = stats.output_tokens.load(Ordering::Relaxed) as f64;
+                    let cost = (ip * in_tok / 1_000_000.0) + (op * out_tok / 1_000_000.0);
+                    if cost >= b {
+                        pb.inc(1);
+                        return;
                     }
                 }
 
@@ -677,9 +702,9 @@ async fn main() -> Result<()> {
                     api_key,
                     &model,
                     &system_prompt,
-                    &cat,
+                    cat,
                     &domain_display,
-                    &subdomain,
+                    subdomain,
                     difficulty,
                     temperature,
                 )
@@ -687,15 +712,14 @@ async fn main() -> Result<()> {
                 {
                     Ok((prompt, in_tok, out_tok)) => {
                         if prompt.trim().is_empty() {
-                            eprintln!("[WARN] task {}: empty prompt, skipping", i + 1);
-                            let mut s = stats.lock().unwrap();
-                            s.errors += 1;
+                            stats.errors.fetch_add(1, Ordering::Relaxed);
+                            pb.inc(1);
                             return;
                         }
                         let entry = TaskEntry {
                             prompt,
                             domain: format!("{}::{}", cat, domain_name),
-                            subdomain,
+                            subdomain: subdomain.clone(),
                             difficulty,
                             taskgen_model: model.clone(),
                             temperature,
@@ -706,33 +730,43 @@ async fn main() -> Result<()> {
                             let _ = f.write_all(line.as_bytes());
                             let _ = f.flush();
                         }
-                        let should_print = {
-                            let mut s = stats.lock().unwrap();
-                            s.total_input_tokens += in_tok;
-                            s.total_output_tokens += out_tok;
-                            s.total_tasks += 1;
-                            (i + 1) % 10 == 0 || i == 0
-                        };
-                        if should_print {
-                            let s = stats.lock().unwrap();
-                            println!("[{}/{}] generated ({} errors)", s.total_tasks, count, s.errors);
-                        }
+                        stats.input_tokens.fetch_add(in_tok, Ordering::Relaxed);
+                        stats.output_tokens.fetch_add(out_tok, Ordering::Relaxed);
+                        let done = stats.tasks.fetch_add(1, Ordering::Relaxed) + 1;
+                        let errs = stats.errors.load(Ordering::Relaxed);
+                        let total_tok = stats.input_tokens.load(Ordering::Relaxed)
+                            + stats.output_tokens.load(Ordering::Relaxed);
+                        pb.set_message(format!(
+                            "{} ok | {} err | {}k tok",
+                            done, errs, total_tok / 1000
+                        ));
                     }
                     Err(e) => {
-                        eprintln!("[ERROR] task {}: {}", i + 1, e);
-                        let mut s = stats.lock().unwrap();
-                        s.errors += 1;
+                        stats.errors.fetch_add(1, Ordering::Relaxed);
+                        pb.suspend(|| eprintln!("[ERROR] task {}: {}", i + 1, e));
                     }
                 }
+                pb.inc(1);
             }
         })
-        .buffer_unordered(workers)
-        .collect()
         .await;
 
-    let stats = stats.lock().unwrap();
-    println!("\nDone! Generated {} tasks ({} errors)", stats.total_tasks, stats.errors);
-    println!("Tokens: {} in / {} out", stats.total_input_tokens, stats.total_output_tokens);
+    pb.finish_with_message("done");
+
+    let total_tasks = stats.tasks.load(Ordering::Relaxed);
+    let total_errors = stats.errors.load(Ordering::Relaxed);
+    let total_in = stats.input_tokens.load(Ordering::Relaxed);
+    let total_out = stats.output_tokens.load(Ordering::Relaxed);
+
+    println!("\nGenerated {} tasks ({} errors)", total_tasks, total_errors);
+    println!("Tokens: {} in / {} out", total_in, total_out);
+
+    let stats = RunStats {
+        total_input_tokens: total_in,
+        total_output_tokens: total_out,
+        total_tasks,
+        errors: total_errors,
+    };
 
     if args.dedup && args.output.exists() {
         println!("\nRunning deduplication (threshold: {:.2})...", args.dedup_threshold);
