@@ -170,6 +170,9 @@ struct Args {
     rotating_proxy: bool,
 
     #[arg(long)]
+    keyfile: Option<PathBuf>,
+
+    #[arg(long)]
     input_price: Option<f64>,
 
     #[arg(long)]
@@ -310,6 +313,24 @@ fn build_clients(proxies: &[reqwest::Proxy]) -> Vec<reqwest::Client> {
                 .expect("failed to build client with proxy")
         })
         .collect()
+}
+
+fn load_api_keys(path: &PathBuf) -> Result<Vec<String>> {
+    let file = File::open(path).context(format!("failed to open keyfile: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut keys = Vec::new();
+    for line in reader.lines() {
+        let line = line.context("failed to read keyfile")?;
+        let line = line.trim().to_string();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        keys.push(line);
+    }
+    if keys.is_empty() {
+        bail!("keyfile is empty: {}", path.display());
+    }
+    Ok(keys)
 }
 
 fn build_domain_pool(dist: &HashMap<String, f64>) -> Vec<(String, String, String, f64)> {
@@ -509,7 +530,18 @@ fn generate_readme(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let api_key = args.api_key.clone().context("API key required. Use --api-key or set OPENAI_API_KEY env var")?;
+    let api_keys: Arc<Vec<String>> = Arc::new(match &args.keyfile {
+        Some(path) => {
+            let keys = load_api_keys(path)?;
+            println!("Loaded {} API keys (round-robin)", keys.len());
+            keys
+        }
+        None => {
+            let key = args.api_key.clone().context("API key required. Use --api-key, set OPENAI_API_KEY, or use --keyfile")?;
+            vec![key]
+        }
+    });
+    let key_counter = Arc::new(AtomicUsize::new(0));
 
     let dist: HashMap<String, f64> = match &args.distribution {
         Some(d) => parse_distribution(d)?,
@@ -582,7 +614,8 @@ async fn main() -> Result<()> {
             let file = file.clone();
             let stats = stats.clone();
             let api_base = args.api_base.clone();
-            let api_key = api_key.clone();
+            let api_keys = api_keys.clone();
+            let key_counter = key_counter.clone();
             let model = args.model.clone();
             let system_prompt = system_prompt.to_string();
             let pool = pool.clone();
@@ -611,11 +644,13 @@ async fn main() -> Result<()> {
                 let domain_display = format!("{}::{}", cat, domain_name);
                 let client_idx = proxy_counter.fetch_add(1, Ordering::Relaxed) % clients.len();
                 let client = &clients[client_idx];
+                let key_idx = key_counter.fetch_add(1, Ordering::Relaxed) % api_keys.len();
+                let api_key = &api_keys[key_idx];
 
                 match generate_task(
                     client,
                     &api_base,
-                    &api_key,
+                    api_key,
                     &model,
                     &system_prompt,
                     &cat,
