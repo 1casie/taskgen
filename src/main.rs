@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
@@ -407,18 +407,117 @@ fn sample_difficulty(rng: &mut impl Rng, dist: &HashMap<u8, f64>) -> u8 {
     levels[idx.sample(rng)]
 }
 
+enum ApiError {
+    RateLimit(Option<u64>),
+    Billing(String),
+    Timeout,
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::RateLimit(s) => write!(f, "rate limited (retry after {:?}s)", s),
+            ApiError::Billing(msg) => write!(f, "billing error: {}", msg),
+            ApiError::Timeout => write!(f, "request timed out"),
+            ApiError::Other(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+fn is_billing_error(status: reqwest::StatusCode, body: &str) -> bool {
+    if status.as_u16() == 402 {
+        return true;
+    }
+    let lower = body.to_lowercase();
+    lower.contains("insufficient_quota")
+        || lower.contains("billing")
+        || lower.contains("payment required")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("account is not active")
+        || lower.contains("insufficient_funds")
+        || lower.contains("budget")
+}
+
+async fn api_request(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &ChatRequest,
+) -> std::result::Result<(String, u64, u64), ApiError> {
+    let resp = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(body)
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            if e.is_timeout() {
+                return Err(ApiError::Timeout);
+            }
+            return Err(ApiError::Other(e.into()));
+        }
+    };
+
+    let status = resp.status();
+
+    if status.as_u16() == 429 {
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        return Err(ApiError::RateLimit(retry_after));
+    }
+
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        if is_billing_error(status, &text) {
+            return Err(ApiError::Billing(text));
+        }
+        return Err(ApiError::Other(anyhow::anyhow!("API error {}: {}", status, text)));
+    }
+
+    let chat_resp: ChatResponse = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Other(anyhow::anyhow!("failed to parse API response: {}", e)))?;
+    let choice = chat_resp
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::Other(anyhow::anyhow!("no choices in response")))?;
+    let prompt_text = choice.message.content.trim().to_string();
+
+    let (input_tokens, output_tokens) = match chat_resp.usage {
+        Some(u) => (u.prompt_tokens, u.completion_tokens),
+        None => (0, 0),
+    };
+
+    Ok((prompt_text, input_tokens, output_tokens))
+}
+
+const MAX_RETRIES: u32 = 5;
+
 async fn generate_task(
     client: &reqwest::Client,
     api_base: &str,
     api_key: &str,
     model: &str,
     system_prompt: &str,
-    category: &str,
+    _category: &str,
     domain_display: &str,
     subdomain: &str,
     difficulty: u8,
     temperature: f64,
-) -> Result<(String, u64, u64)> {
+    cancel: &AtomicBool,
+    consecutive_timeouts: &AtomicUsize,
+    pb: &ProgressBar,
+) -> std::result::Result<(String, u64, u64), ApiError> {
     let user_msg = format!(
         "Generate a task/prompt for the following:\n\nDomain: {}\nSubdomain: {}\nDifficulty: {}/10 ({})\n\nThe task MUST be directly and specifically about the subdomain \"{}\" within {}. Do NOT generate a generic {} task — the content must focus on {} specifically.\n\nOutput only the task prompt, nothing else.",
         domain_display, subdomain, difficulty, difficulty_label(difficulty),
@@ -436,31 +535,58 @@ async fn generate_task(
     };
 
     let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .context("API request failed")?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("API error {}: {}", status, text);
+    let mut retries = 0u32;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ApiError::Other(anyhow::anyhow!("cancelled")));
+        }
+
+        match api_request(client, &url, api_key, &body).await {
+            Ok(result) => {
+                consecutive_timeouts.store(0, Ordering::Relaxed);
+                return Ok(result);
+            }
+            Err(ApiError::RateLimit(retry_after)) => {
+                retries += 1;
+                if retries > MAX_RETRIES {
+                    return Err(ApiError::RateLimit(retry_after));
+                }
+                let wait = retry_after.unwrap_or_else(|| 2u64.pow(retries).min(60));
+                pb.suspend(|| {
+                    eprintln!("[RATE] 429 hit, waiting {}s (retry {}/{})", wait, retries, MAX_RETRIES);
+                });
+                tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+            }
+            Err(ApiError::Timeout) => {
+                let count = consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= 5 {
+                    pb.suspend(|| {
+                        eprintln!("[FATAL] {} consecutive timeouts, shutting down gracefully...", count);
+                    });
+                    cancel.store(true, Ordering::Relaxed);
+                    return Err(ApiError::Timeout);
+                }
+                retries += 1;
+                if retries > MAX_RETRIES {
+                    return Err(ApiError::Timeout);
+                }
+                let wait = 2u64.pow(retries).min(30);
+                pb.suspend(|| {
+                    eprintln!("[TIMEOUT] request timed out, waiting {}s (retry {}/{}, {} consecutive)", wait, retries, MAX_RETRIES, count);
+                });
+                tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+            }
+            Err(ApiError::Billing(msg)) => {
+                pb.suspend(|| {
+                    eprintln!("[FATAL] billing error, shutting down gracefully: {}", msg);
+                });
+                cancel.store(true, Ordering::Relaxed);
+                return Err(ApiError::Billing(msg));
+            }
+            Err(e) => return Err(e),
+        }
     }
-
-    let chat_resp: ChatResponse = resp.json().await.context("failed to parse API response")?;
-    let choice = chat_resp.choices.into_iter().next().context("no choices in response")?;
-    let prompt_text = choice.message.content.trim().to_string();
-
-    let (input_tokens, output_tokens) = match chat_resp.usage {
-        Some(u) => (u.prompt_tokens, u.completion_tokens),
-        None => (0, 0),
-    };
-
-    Ok((prompt_text, input_tokens, output_tokens))
 }
 
 fn count_existing_tasks(path: &PathBuf) -> usize {
@@ -634,6 +760,8 @@ async fn main() -> Result<()> {
 
     let file = Arc::new(std::sync::Mutex::new(file));
     let stats = Arc::new(AtomicStats::new());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let consecutive_timeouts = Arc::new(AtomicUsize::new(0));
 
     let budget = args.budget;
     let input_price = args.input_price;
@@ -668,6 +796,8 @@ async fn main() -> Result<()> {
             let proxy_counter = proxy_counter.clone();
             let file = file.clone();
             let stats = stats.clone();
+            let cancel = cancel.clone();
+            let consecutive_timeouts = consecutive_timeouts.clone();
             let api_base = args.api_base.clone();
             let api_keys = api_keys.clone();
             let key_counter = key_counter.clone();
@@ -678,6 +808,11 @@ async fn main() -> Result<()> {
             let pb = pb.clone();
 
             async move {
+                if cancel.load(Ordering::Relaxed) {
+                    pb.inc(1);
+                    return;
+                }
+
                 let (ref cat, ref domain_name, ref subdomain, difficulty) = presampled[i];
 
                 if let (Some(b), Some(ip), Some(op)) = (budget, input_price, output_price) {
@@ -707,6 +842,9 @@ async fn main() -> Result<()> {
                     subdomain,
                     difficulty,
                     temperature,
+                    &cancel,
+                    &consecutive_timeouts,
+                    &pb,
                 )
                 .await
                 {
@@ -743,7 +881,9 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         stats.errors.fetch_add(1, Ordering::Relaxed);
-                        pb.suspend(|| eprintln!("[ERROR] task {}: {}", i + 1, e));
+                        if !cancel.load(Ordering::Relaxed) {
+                            pb.suspend(|| eprintln!("[ERROR] task {}: {}", i + 1, e));
+                        }
                     }
                 }
                 pb.inc(1);
@@ -751,14 +891,22 @@ async fn main() -> Result<()> {
         })
         .await;
 
-    pb.finish_with_message("done");
+    let was_cancelled = cancel.load(Ordering::Relaxed);
+    if was_cancelled {
+        pb.finish_with_message("stopped early — saving progress");
+    } else {
+        pb.finish_with_message("done");
+    }
 
     let total_tasks = stats.tasks.load(Ordering::Relaxed);
     let total_errors = stats.errors.load(Ordering::Relaxed);
     let total_in = stats.input_tokens.load(Ordering::Relaxed);
     let total_out = stats.output_tokens.load(Ordering::Relaxed);
 
-    println!("\nGenerated {} tasks ({} errors)", total_tasks, total_errors);
+    if was_cancelled {
+        println!("\nGraceful shutdown — saved {} tasks before exit", total_tasks);
+    }
+    println!("Generated {} tasks ({} errors)", total_tasks, total_errors);
     println!("Tokens: {} in / {} out", total_in, total_out);
 
     let stats = RunStats {
