@@ -28,6 +28,17 @@ Rules:
 - For conversation tasks, set up a realistic conversational scenario.
 - CRITICAL: If the subdomain is "electromagnetism", the task must be about electromagnetism specifically, not general mechanics or optics. If the subdomain is "sorting", the task must involve sorting algorithms, not graph traversal. This strict alignment applies to ALL subdomains."#;
 
+const LANGUAGES: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("de", "German"),
+    ("fr", "French"),
+    ("es", "Spanish"),
+    ("nl", "Dutch"),
+    ("zh", "Chinese"),
+    ("ar", "Arabic"),
+    ("ru", "Russian"),
+];
+
 const DONATION_BTC: &str = "bc1qx6zepu6sfkvshgdmc4ewu6pk6rpadvpgffpp7v";
 const DONATION_LTC: &str = "ltc1qv2mefzps2vtjcpwfx8xxdrpplrcvltswm68r7x";
 const DONATION_XMR: &str = "42Dbm5xg5Nq26fdyzfEU7KBnAJfhi7Cvz5J2ex5CzHXkfKuNEJzYCcmJ1GTbgjFZ5MBx72sdG1G9239Cd6rsZfv4QeDkYJY";
@@ -194,6 +205,10 @@ struct Args {
 
     #[arg(long)]
     budget: Option<f64>,
+
+    /// Generate tasks in multiple languages (en, de, fr, es, nl, zh, ar, ru)
+    #[arg(long)]
+    multilingual: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +217,8 @@ struct TaskEntry {
     domain: String,
     subdomain: String,
     difficulty: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
     taskgen_model: String,
     temperature: f64,
 }
@@ -693,14 +710,24 @@ async fn generate_task(
     subdomain: &str,
     difficulty: u8,
     temperature: f64,
+    language: Option<&str>,
     cancel: &AtomicBool,
     consecutive_timeouts: &AtomicUsize,
     pb: &ProgressBar,
 ) -> std::result::Result<(String, u64, u64), ApiError> {
+    let lang_instruction = match language {
+        Some(code) if code != "en" => {
+            let lang_name = LANGUAGES.iter().find(|(c, _)| *c == code).map(|(_, n)| *n).unwrap_or("English");
+            format!("\n\nIMPORTANT: Write the entire task/prompt in {}. Do NOT use English.", lang_name)
+        }
+        _ => String::new(),
+    };
+
     let user_msg = format!(
-        "Generate a task/prompt for the following:\n\nDomain: {}\nSubdomain: {}\nDifficulty: {}/10 ({})\n\nThe task MUST be directly and specifically about the subdomain \"{}\" within {}. Do NOT generate a generic {} task — the content must focus on {} specifically.\n\nOutput only the task prompt, nothing else.",
+        "Generate a task/prompt for the following:\n\nDomain: {}\nSubdomain: {}\nDifficulty: {}/10 ({})\n\nThe task MUST be directly and specifically about the subdomain \"{}\" within {}. Do NOT generate a generic {} task — the content must focus on {} specifically.\n\nOutput only the task prompt, nothing else.{}",
         domain_display, subdomain, difficulty, difficulty_label(difficulty),
-        subdomain, domain_display, domain_display, subdomain
+        subdomain, domain_display, domain_display, subdomain,
+        lang_instruction
     );
 
     let body = ChatRequest {
@@ -966,13 +993,20 @@ async fn main() -> Result<()> {
     let count = args.count;
     let workers = args.workers;
 
-    // pre-sample all domain/difficulty pairs to avoid RNG contention in workers
+    // pre-sample all domain/difficulty/language tuples to avoid RNG contention in workers
     let mut rng = thread_rng();
-    let presampled: Vec<(String, String, String, u8)> = (0..count)
+    let multilingual = args.multilingual;
+    let presampled: Vec<(String, String, String, u8, Option<String>)> = (0..count)
         .map(|_| {
             let (cat, name, sub) = sample_domain(&mut rng, &pool);
             let diff = sample_difficulty(&mut rng, &diff_dist);
-            (cat, name, sub, diff)
+            let lang = if multilingual {
+                let idx = rng.gen_range(0..LANGUAGES.len());
+                Some(LANGUAGES[idx].0.to_string())
+            } else {
+                None
+            };
+            (cat, name, sub, diff, lang)
         })
         .collect();
 
@@ -1051,7 +1085,7 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                let (ref cat, ref domain_name, ref subdomain, difficulty) = presampled[i];
+                let (ref cat, ref domain_name, ref subdomain, difficulty, ref lang) = presampled[i];
 
                 if let (Some(b), Some(ip), Some(op)) = (budget, input_price, output_price) {
                     let in_tok = stats.input_tokens.load(Ordering::Relaxed) as f64;
@@ -1089,6 +1123,7 @@ async fn main() -> Result<()> {
                     subdomain,
                     difficulty,
                     temperature,
+                    lang.as_deref(),
                     &cancel,
                     &consecutive_timeouts,
                     &pb,
@@ -1106,6 +1141,7 @@ async fn main() -> Result<()> {
                             domain: format!("{}::{}", cat, domain_name),
                             subdomain: subdomain.clone(),
                             difficulty,
+                            language: lang.clone(),
                             taskgen_model: use_model,
                             temperature,
                         };
@@ -1266,6 +1302,35 @@ async fn main() -> Result<()> {
             println!("Deduplication complete: {} removed, {} remaining", total_removed, remaining);
         } else {
             println!("No duplicates found");
+        }
+    }
+
+    // split output into per-language files when --multilingual is set
+    if multilingual && args.output.exists() {
+        println!("\nSplitting output by language...");
+        let reader = BufReader::new(File::open(&args.output)?);
+        let mut lang_buckets: HashMap<String, Vec<String>> = HashMap::new();
+
+        for line in reader.lines().flatten() {
+            let lang_code = serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .and_then(|v| v.get("language").and_then(|l| l.as_str().map(|s| s.to_string())))
+                .unwrap_or_else(|| "en".to_string());
+            lang_buckets.entry(lang_code).or_default().push(line);
+        }
+
+        let out_dir = args.output.parent().unwrap_or(std::path::Path::new("."));
+        let stem = args.output.file_stem().unwrap_or_default().to_string_lossy();
+        let ext = args.output.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+
+        for (lang, lines) in &lang_buckets {
+            let lang_path = out_dir.join(format!("{}_{}{}", stem, lang, ext));
+            let mut f = File::create(&lang_path)?;
+            for line in lines {
+                f.write_all(line.as_bytes())?;
+                f.write_all(b"\n")?;
+            }
+            println!("  {} — {} tasks -> {}", lang, lines.len(), lang_path.display());
         }
     }
 
