@@ -1111,6 +1111,7 @@ async fn main() -> Result<()> {
                     let out_tok = stats.output_tokens.load(Ordering::Relaxed) as f64;
                     let cost = (ip * in_tok / 1_000_000.0) + (op * out_tok / 1_000_000.0);
                     if cost >= b {
+                        cancel.store(true, Ordering::Relaxed);
                         pb.inc(1);
                         return;
                     }
@@ -1174,11 +1175,24 @@ async fn main() -> Result<()> {
                         stats.output_tokens.fetch_add(out_tok, Ordering::Relaxed);
                         let done = stats.tasks.fetch_add(1, Ordering::Relaxed) + 1;
                         let errs = stats.errors.load(Ordering::Relaxed);
-                        let total_tok = stats.input_tokens.load(Ordering::Relaxed)
-                            + stats.output_tokens.load(Ordering::Relaxed);
+                        let cur_in = stats.input_tokens.load(Ordering::Relaxed) as f64;
+                        let cur_out = stats.output_tokens.load(Ordering::Relaxed) as f64;
+                        let total_tok = (cur_in + cur_out) as u64;
+                        let cost_str = match (input_price, output_price) {
+                            (Some(ip), Some(op)) => {
+                                let cost = (ip * cur_in / 1_000_000.0) + (op * cur_out / 1_000_000.0);
+                                if let Some(b) = budget {
+                                    if cost >= b {
+                                        cancel.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                                format!(" | ${:.4}", cost)
+                            }
+                            _ => String::new(),
+                        };
                         pb.set_message(format!(
-                            "{} ok | {} err | {}k tok",
-                            done, errs, total_tok / 1000
+                            "{} ok | {} err | {}k tok{}",
+                            done, errs, total_tok / 1000, cost_str
                         ));
                     }
                     Err(e) => {
