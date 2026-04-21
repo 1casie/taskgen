@@ -1,0 +1,22 @@
+Écris les prompts comme si une personne normale posait une question sur un forum ou Stack Overflow. Elle pourrait être fatiguée ou frustrée, mais elle est compétente. Elle énonce le problème directement sans explications excessives. Ne sois pas un enfant. Ne sois pas un robot. Sois quelqu'un qui a oublié d'être formel.
+
+Bons exemples (casual): "comment inverser une matrice en numpy?", "j'ai un off-by-one dans mon quicksort, code joint", "pourquoi ma fetch async retourne undefined"
+Mauvais exemples (casual): "wtf mon code cassé aide omg ffs" (trop stupide)
+
+CRITIQUE: La difficulté affecte à la fois la formulation ET la complexité/portée du problème:
+
+- Difficulté 1-3: Questions basiques, confusion genuine, formulation simple. Le problème a une réponse claire. "comment trouver la distance entre deux points?" "quelle est la différence entre les chaînes alimentaires et les réseaux alimentaires?"
+
+- Difficulté 4-5: Personne compétente avec un vrai problème technique. Énonce-le directement. Le problème a de l'ambiguïté ou des approches concurrentes. "Je fais une régression logistique mais l'écart val/train est énorme—quelle est la façon la plus propre de régulariser sans tuning manuel?" Inclus ce que tu as essayé.
+
+- Difficulté 6-7: Niveau expert, utilise la terminologie naturellement. Le problème en soi a des tensions inhérentes, des trade-offs ou des choix de conception. Énonce-les franchement. "Je construis un schéma pour OLAP à l'échelle du pétaoctet—dénormaliser les rollups par tenant ou aller avec hypertables/Citus? Trade-offs entre perf des requêtes et stockage?" Ne cache pas la complexité; formule-le casualmente mais complètement.
+
+- Difficulté 8-10: Niveau de pointe ou polymathique. Le problème a plusieurs formulations valides, des résultats incertains ou nécessite une synthèse entre domaines. Énonce ce qui est difficile, ce qui est incertain, ce que tu essaies d'équilibrer. Utilise un langage casual mais préserve le poids intellectuel complet. Exemple: "prouver que snapshot isolation atteint strict serializability—le graphe de sérialisation explose sur les phantoms cross-partition lors des récupérations. Y a-t-il des techniques de réduction ou des générateurs de contreexemples qui gèrent les effets WAL redo?" C'est expert à expert: tu assumes qu'ils connaissent le domaine, tu es honnête sur où tu es bloqué.
+
+Écris comme tu texterais un ami qui est bon en ça. Utilise la ponctuation normale. La tâche fondamentale doit être correcte.
+
+Pour difficulté 6+: Inclus des conflits de contraintes genuins, des trade-offs de conception ou des questions ouvertes—mais formule-les comme une personne compétente le ferait, pas comme de la prose formelle. N'invente pas de fausse complexité. Préserve bien la complexité réelle que les utilisateurs articularaient.
+
+Saute le boilerplate. N'inclus pas de commandes, blocs de code ou versions à moins que l'utilisateur ne les collerait réellement. "mon programme c ne compile pas" est mieux que "essayant de construire avec gcc 12.2 sur Ubuntu 22.04." Mais "gcc 12.2 signale ceci comme une erreur, probablement un truc stdlib" est ok si c'est du vrai contexte.
+
+Garde-le court. Dis le problème, pas la vie entière. Génère seulement le prompt lui-même. Mais "court" ≠ "simple"—ça veut dire: pas de remplissage, mais toute la vraie complexité intacte.

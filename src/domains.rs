@@ -1,0 +1,408 @@
+#[derive(Debug, Clone)]
+pub struct DomainDef {
+    pub category: &'static str,
+    pub name: &'static str,
+    pub subdomains: &'static [&'static str],
+}
+
+pub static DOMAINS: &[DomainDef] = &[
+    DomainDef {
+        category: "math",
+        name: "Algebra",
+        subdomains: &[
+            "linear_equations",
+            "polynomials",
+            "inequalities",
+            "matrices",
+            "abstract_algebra",
+        ],
+    },
+    DomainDef {
+        category: "math",
+        name: "Calculus",
+        subdomains: &[
+            "derivatives",
+            "integrals",
+            "limits",
+            "series",
+            "multivariable",
+        ],
+    },
+    DomainDef {
+        category: "math",
+        name: "Probability",
+        subdomains: &[
+            "bayesian",
+            "distributions",
+            "combinatorics",
+            "stochastic_processes",
+            "markov_chains",
+        ],
+    },
+    DomainDef {
+        category: "math",
+        name: "Statistics",
+        subdomains: &[
+            "hypothesis_testing",
+            "regression",
+            "anova",
+            "descriptive",
+            "bayesian_stats",
+        ],
+    },
+    DomainDef {
+        category: "math",
+        name: "Geometry",
+        subdomains: &[
+            "euclidean",
+            "analytic",
+            "differential",
+            "topology",
+            "trigonometry",
+        ],
+    },
+    DomainDef {
+        category: "math",
+        name: "Number Theory",
+        subdomains: &[
+            "primes",
+            "modular_arithmetic",
+            "diophantine",
+            "cryptographic",
+            "algebraic_nt",
+        ],
+    },
+    DomainDef {
+        category: "math",
+        name: "Discrete Math",
+        subdomains: &[
+            "graph_theory",
+            "combinatorics",
+            "logic",
+            "set_theory",
+            "recurrence",
+        ],
+    },
+    DomainDef {
+        category: "math",
+        name: "Linear Algebra",
+        subdomains: &[
+            "vector_spaces",
+            "eigenvalues",
+            "transformations",
+            "inner_product",
+            "decompositions",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "Web Development",
+        subdomains: &[
+            "html_css",
+            "javascript",
+            "react",
+            "nodejs",
+            "rest_apis",
+            "databases",
+            "authentication",
+            "websockets",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "C++",
+        subdomains: &[
+            "templates",
+            "stl",
+            "memory_management",
+            "concurrency",
+            "meta_programming",
+            "algorithms",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "Java",
+        subdomains: &[
+            "spring",
+            "concurrency",
+            "jvm",
+            "design_patterns",
+            "streams",
+            "generics",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "JavaScript",
+        subdomains: &[
+            "async_await",
+            "closures",
+            "prototypes",
+            "modules",
+            "typescript",
+            "dom",
+            "node",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "C",
+        subdomains: &[
+            "pointers",
+            "memory",
+            "systems_programming",
+            "ffi",
+            "embedded",
+            "algorithms",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "Ruby",
+        subdomains: &[
+            "metaprogramming",
+            "rails",
+            "blocks_procs",
+            "concurrency",
+            "gems",
+            "dsls",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "Lua",
+        subdomains: &[
+            "coroutines",
+            "metatable",
+            "game_scripting",
+            "embedded",
+            "neovim",
+            "love2d",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "Rust",
+        subdomains: &[
+            "ownership",
+            "lifetimes",
+            "traits",
+            "async",
+            "unsafe",
+            "macros",
+            "cargo",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "C#",
+        subdomains: &[
+            "linq",
+            "async",
+            "unity",
+            "dotnet",
+            "generics",
+            "reflection",
+            "entity_framework",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "Python",
+        subdomains: &[
+            "data_science",
+            "ml",
+            "web_frameworks",
+            "scripting",
+            "asyncio",
+            "decorators",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "Go",
+        subdomains: &[
+            "goroutines",
+            "channels",
+            "interfaces",
+            "modules",
+            "networking",
+            "microservices",
+        ],
+    },
+    DomainDef {
+        category: "coding",
+        name: "SQL",
+        subdomains: &[
+            "queries",
+            "optimization",
+            "schema_design",
+            "transactions",
+            "window_functions",
+            "nosql_comparison",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Physics",
+        subdomains: &[
+            "mechanics",
+            "thermodynamics",
+            "electromagnetism",
+            "quantum",
+            "relativity",
+            "optics",
+            "fluid_dynamics",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Chemistry",
+        subdomains: &[
+            "organic",
+            "inorganic",
+            "physical",
+            "analytical",
+            "biochemistry",
+            "electrochemistry",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Biology",
+        subdomains: &[
+            "genetics",
+            "ecology",
+            "cell_biology",
+            "evolution",
+            "microbiology",
+            "neuroscience",
+            "immunology",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Earth Science",
+        subdomains: &[
+            "geology",
+            "meteorology",
+            "oceanography",
+            "climate",
+            "mineralogy",
+            "volcanology",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Astronomy",
+        subdomains: &[
+            "stellar",
+            "planetary",
+            "cosmology",
+            "astrophysics",
+            "observational",
+            "astrobiology",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Geography",
+        subdomains: &["physical", "human", "cartography", "gis", "urban_planning"],
+    },
+    DomainDef {
+        category: "science",
+        name: "Economics",
+        subdomains: &[
+            "micro",
+            "macro",
+            "game_theory",
+            "econometrics",
+            "behavioral",
+            "international_trade",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Psychology",
+        subdomains: &[
+            "cognitive",
+            "developmental",
+            "social",
+            "clinical",
+            "neuropsychology",
+            "personality",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Philosophy",
+        subdomains: &[
+            "logic",
+            "ethics",
+            "metaphysics",
+            "epistemology",
+            "aesthetics",
+            "political_philosophy",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Linguistics",
+        subdomains: &[
+            "phonology",
+            "syntax",
+            "semantics",
+            "pragmatics",
+            "sociolinguistics",
+            "historical",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Engineering",
+        subdomains: &[
+            "mechanical",
+            "electrical",
+            "civil",
+            "software",
+            "aerospace",
+            "materials",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Medicine",
+        subdomains: &[
+            "anatomy",
+            "physiology",
+            "pathology",
+            "pharmacology",
+            "immunology",
+            "epidemiology",
+        ],
+    },
+    DomainDef {
+        category: "science",
+        name: "Computer Science",
+        subdomains: &[
+            "algorithms",
+            "complexity",
+            "automata",
+            "compilers",
+            "os",
+            "networks",
+            "security",
+            "ai_ml",
+        ],
+    },
+];
+
+impl DomainDef {
+    pub fn all_subdomains(&self) -> Vec<(String, String)> {
+        self.subdomains
+            .iter()
+            .map(|s| (self.name.to_string(), s.to_string()))
+            .collect()
+    }
+}

@@ -1,0 +1,22 @@
+Escribe prompts como si una persona normal preguntara en un foro o Stack Overflow. Podría estar cansada o frustrada, pero es competente. Plantea el problema directamente sin explicaciones excesivas. No seas un niño. No seas un robot. Sé una persona que olvidó ser formal.
+
+Ejemplos buenos (casual): "¿cómo invierto una matriz en numpy?", "tengo un off-by-one en mi quicksort, código adjunto", "¿por qué mi async fetch retorna undefined"
+Ejemplos malos (casual): "wtf mi código roto ayuda omg ffs" (muy estúpido)
+
+CRÍTICO: La dificultad afecta tanto la redacción como la complejidad del problema:
+
+- Dificultad 1-3: Preguntas básicas, confusión genuina, redacción simple. El problema tiene una respuesta clara. "¿cómo encuentro la distancia entre dos puntos?" "¿cuál es la diferencia entre cadenas alimenticias y redes alimenticias?"
+
+- Dificultad 4-5: Persona competente con un problema técnico real. Plantéalo directamente. El problema tiene cierta ambigüedad o enfoques en competencia. "Estoy ajustando logistic regression pero la brecha val/train es enorme—¿cuál es la forma más limpia de regularizar sin tuning manual?" Incluye qué has intentado.
+
+- Dificultad 6-7: Nivel experto, usa terminología naturalmente. El problema en sí tiene tensiones inherentes, trade-offs o decisiones de diseño. Exprésalas francamente. "Estoy construyendo un schema para OLAP a escala de petabytes—¿denormalizar rollups por tenant o ir con hypertables/Citus? ¿Trade-offs entre query perf y storage?" No ocultes la complejidad; redáctalo casualmente pero completamente.
+
+- Dificultad 8-10: Nivel de vanguardia o polimático. El problema tiene múltiples formulaciones válidas, resultados inciertos o requiere síntesis entre dominios. Expresa qué es difícil, qué es incierto, qué estás intentando equilibrar. Usa lenguaje casual pero preserva el peso intelectual completo. Ejemplo: "¿probar que snapshot isolation logra strict serializability—serialization graph explota en phantoms cross-partition durante recuperaciones. ¿Hay técnicas de reducción o generadores de contraejemplos que manejen efectos de WAL redo?" Esto es experto a experto: asumes que conocen el dominio, eres honesto sobre dónde estás atrapado.
+
+Escribe como le escribirías un texto a un amigo que es bueno en esto. Usa puntuación normal. La tarea principal debe ser correcta.
+
+Para dificultad 6+: Incluye conflictos genuinos de restricciones, trade-offs de diseño o preguntas abiertas—pero redáctalos como lo haría una persona competente, no como prosa formal. No inventes complejidad falsa. Sí preserva la complejidad real que los usuarios articularían.
+
+Omite boilerplate. No incluyas comandos, bloques de código o versiones a menos que el usuario realmente los pegaría. "mi programa c no compila" es mejor que "intentando construir con gcc 12.2 en Ubuntu 22.04." Pero "gcc 12.2 marca esto como error, probablemente algo de stdlib" está bien si es contexto real.
+
+Mantenlo breve. Di el problema, no la historia de vida. Genera solo el prompt. Pero "breve" ≠ "simple"—significa: sin relleno, pero toda la complejidad real intacta.

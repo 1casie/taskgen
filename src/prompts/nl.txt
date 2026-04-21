@@ -1,0 +1,22 @@
+Schrijf prompts alsof een normale persoon een vraag stelt op een forum of Stack Overflow. Ze kunnen moe of gefrustreerd zijn, maar zijn wel competent. Ze stellen het probleem direct zonder buitensporige uitleg. Wees geen kind. Wees geen robot. Wees iemand die vergeten is formeel te zijn.
+
+Goede casual voorbeelden: "hoe inverteer ik een matrix in numpy?", "heb een off-by-one in mijn quicksort, code bijgevoegd", "waarom geeft mijn async fetch undefined terug"
+Slechte casual voorbeelden: "wtf mijn code kapot help omg ffs" (te dom)
+
+KRITIEK: Moeilijkheidsgraad beïnvloedt zowel formulering ALS probleemcomplexiteit/omvang:
+
+- Moeilijkheid 1-3: Basisvragen, echte verwarring, eenvoudige formulering. Probleem heeft een duidelijk antwoord. "hoe vind ik de afstand tussen twee punten?" "wat is het verschil tussen voedselketens en voedselwebben?"
+
+- Moeilijkheid 4-5: Competente persoon met echt technisch probleem. Stel het direct. Probleem heeft enige ambiguïteit of concurrerende benaderingen. "Ik pas logistic regression toe maar de val/train gap is enorm—wat is de schoonste manier om te regulariseren zonder handmatig tuning?" Voeg toe wat je hebt geprobeerd.
+
+- Moeilijkheid 6-7: Niveau van expert, gebruik terminologie natuurlijk. Het probleem zelf heeft inherente spanningen, trade-offs of ontwerpkeuzes. Stel ze frank uit. "Ik bouw een schema voor petabyte-schaal OLAP—denormaliseer rollups per tenant of ga naar hypertables/Citus? Trade-offs voor query perf vs storage?" Verberg de complexiteit niet; formuleer het casual maar compleet.
+
+- Moeilijkheid 8-10: Cutting-edge of polymath-niveau. Probleem heeft meerdere geldige framings, onzekere uitkomsten of vereist synthese tussen domeinen. Stel wat moeilijk is, wat onzeker is, wat je probeert af te wegen. Gebruik casual taal maar behoud volledig intellectueel gewicht. Voorbeeld: "bewijzen dat snapshot isolation strict serializability bereikt—serialization graph exploodeert op cross-partition phantoms tijdens recovery. Zijn er reductionstechnieken of counterexample generators die WAL redo effecten aankunnen?" Dit is expert-naar-expert: je gaat ervan uit dat ze het domein kennen, je bent eerlijk over waar je vastzit.
+
+Schrijf zoals je een vriend zou texten die hier goed in is. Gebruik normale interpunctie. De kerntaak moet correct zijn.
+
+Voor moeilijkheid 6+: Neem echte beperkingsconflicten, ontwerptrade-offs of openstaande vragen op—maar formuleer ze zoals een competent persoon zou doen, niet als formele proza. Verzin geen valse complexiteit. Behoud wel echte complexiteit die gebruikers werkelijk zouden articuleren.
+
+Sla boilerplate over. Voeg geen commands, codeblokken of versies toe tenzij de gebruiker ze echt zou plakken. "mijn c programma compileert niet" is beter dan "probeer te bouwen met gcc 12.2 op Ubuntu 22.04." Maar "gcc 12.2 vlagt dit als fout, waarschijnlijk iets met stdlib" is ok als het echte context is.
+
+Hou het kort. Zeg het probleem, niet de hele levensverhaal. Geef alleen de prompt zelf. Maar "kort" ≠ "eenvoudig"—betekent: geen opvulling, maar alle werkelijke complexiteit intact.

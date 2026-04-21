@@ -1,146 +1,34 @@
+mod constants;
+mod dedup;
+mod domains;
+mod generation;
+mod models;
+mod prompts;
+mod readme;
+
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use chrono::Local;
+use anyhow::{Context, Result};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a task generator for SFT (Supervised Fine-Tuning) distillation datasets. Given a domain, subdomain, and difficulty level, generate a single, self-contained prompt/task that a language model would be expected to respond to.
+use crate::constants::LANGUAGES;
+use crate::domains::DOMAINS;
+use crate::generation::stats::Stats;
+use crate::models::{RunStats, TaskEntry};
+use crate::prompts::build_system_prompt;
+use crate::readme::generate_readme;
 
-Rules:
-- The task MUST be directly and specifically about the given subdomain. The subdomain must be the central focus of the task, not just the broader domain category.
-- The difficulty must match the requested level (1-10 scale where 1=basic child-level, 10=polymath/genius expert).
-- Output ONLY the task prompt itself, nothing else. No preamble, no explanation, no labels.
-- The task should be realistic and useful for training purposes.
-- For coding tasks, specify the language if applicable.
-- For math tasks, the problem should be solvable and well-defined.
-- For science tasks, be precise about the subfield and concept.
-- For creative writing, provide a rich, evocative prompt.
-- For conversation tasks, set up a realistic conversational scenario.
-- CRITICAL: If the subdomain is "electromagnetism", the task must be about electromagnetism specifically, not general mechanics or optics. If the subdomain is "sorting", the task must involve sorting algorithms, not graph traversal. This strict alignment applies to ALL subdomains."#;
-
-const LANGUAGES: &[(&str, &str)] = &[
-    ("en", "English"),
-    ("de", "German"),
-    ("fr", "French"),
-    ("es", "Spanish"),
-    ("nl", "Dutch"),
-    ("zh", "Chinese"),
-    ("ar", "Arabic"),
-    ("ru", "Russian"),
-];
-
-const DONATION_BTC: &str = "bc1qx6zepu6sfkvshgdmc4ewu6pk6rpadvpgffpp7v";
-const DONATION_LTC: &str = "ltc1qv2mefzps2vtjcpwfx8xxdrpplrcvltswm68r7x";
-const DONATION_XMR: &str = "42Dbm5xg5Nq26fdyzfEU7KBnAJfhi7Cvz5J2ex5CzHXkfKuNEJzYCcmJ1GTbgjFZ5MBx72sdG1G9239Cd6rsZfv4QeDkYJY";
-
-#[derive(Debug, Clone)]
-struct DomainDef {
-    category: &'static str,
-    name: &'static str, 
-    subdomains: &'static [&'static str],
-}
-
-static DOMAINS: &[DomainDef] = &[
-    DomainDef { category: "math", name: "Algebra", subdomains: &["linear_equations", "polynomials", "inequalities", "matrices", "abstract_algebra"] },
-    DomainDef { category: "math", name: "Calculus", subdomains: &["derivatives", "integrals", "limits", "series", "multivariable"] },
-    DomainDef { category: "math", name: "Probability", subdomains: &["bayesian", "distributions", "combinatorics", "stochastic_processes", "markov_chains"] },
-    DomainDef { category: "math", name: "Statistics", subdomains: &["hypothesis_testing", "regression", "anova", "descriptive", "bayesian_stats"] },
-    DomainDef { category: "math", name: "Geometry", subdomains: &["euclidean", "analytic", "differential", "topology", "trigonometry"] },
-    DomainDef { category: "math", name: "Number Theory", subdomains: &["primes", "modular_arithmetic", "diophantine", "cryptographic", "algebraic_nt"] },
-    DomainDef { category: "math", name: "Discrete Math", subdomains: &["graph_theory", "combinatorics", "logic", "set_theory", "recurrence"] },
-    DomainDef { category: "math", name: "Linear Algebra", subdomains: &["vector_spaces", "eigenvalues", "transformations", "inner_product", "decompositions"] },
-    DomainDef { category: "coding", name: "Web Development", subdomains: &["html_css", "javascript", "react", "nodejs", "rest_apis", "databases", "authentication", "websockets"] },
-    DomainDef { category: "coding", name: "C++", subdomains: &["templates", "stl", "memory_management", "concurrency", "meta_programming", "algorithms"] },
-    DomainDef { category: "coding", name: "Java", subdomains: &["spring", "concurrency", "jvm", "design_patterns", "streams", "generics"] },
-    DomainDef { category: "coding", name: "JavaScript", subdomains: &["async_await", "closures", "prototypes", "modules", "typescript", "dom", "node"] },
-    DomainDef { category: "coding", name: "C", subdomains: &["pointers", "memory", "systems_programming", "ffi", "embedded", "algorithms"] },
-    DomainDef { category: "coding", name: "Ruby", subdomains: &["metaprogramming", "rails", "blocks_procs", "concurrency", "gems", "dsls"] },
-    DomainDef { category: "coding", name: "Lua", subdomains: &["coroutines", "metatable", "game_scripting", "embedded", "neovim", "love2d"] },
-    DomainDef { category: "coding", name: "Rust", subdomains: &["ownership", "lifetimes", "traits", "async", "unsafe", "macros", "cargo"] },
-    DomainDef { category: "coding", name: "C#", subdomains: &["linq", "async", "unity", "dotnet", "generics", "reflection", "entity_framework"] },
-    DomainDef { category: "coding", name: "Python", subdomains: &["data_science", "ml", "web_frameworks", "scripting", "asyncio", "decorators"] },
-    DomainDef { category: "coding", name: "Go", subdomains: &["goroutines", "channels", "interfaces", "modules", "networking", "microservices"] },
-    DomainDef { category: "coding", name: "SQL", subdomains: &["queries", "optimization", "schema_design", "transactions", "window_functions", "nosql_comparison"] },
-    DomainDef { category: "science", name: "Physics", subdomains: &["mechanics", "thermodynamics", "electromagnetism", "quantum", "relativity", "optics", "fluid_dynamics"] },
-    DomainDef { category: "science", name: "Chemistry", subdomains: &["organic", "inorganic", "physical", "analytical", "biochemistry", "electrochemistry"] },
-    DomainDef { category: "science", name: "Biology", subdomains: &["genetics", "ecology", "cell_biology", "evolution", "microbiology", "neuroscience", "immunology"] },
-    DomainDef { category: "science", name: "Earth Science", subdomains: &["geology", "meteorology", "oceanography", "climate", "mineralogy", "volcanology"] },
-    DomainDef { category: "science", name: "Astronomy", subdomains: &["stellar", "planetary", "cosmology", "astrophysics", "observational", "astrobiology"] },
-    DomainDef { category: "cs", name: "Algorithms", subdomains: &["sorting", "searching", "dynamic_programming", "greedy", "divide_conquer", "graph_algorithms"] },
-    DomainDef { category: "cs", name: "Data Structures", subdomains: &["trees", "graphs", "hash_tables", "heaps", "tries", "bloom_filters"] },
-    DomainDef { category: "cs", name: "Operating Systems", subdomains: &["processes", "memory_management", "filesystems", "scheduling", "virtualization", "concurrency"] },
-    DomainDef { category: "cs", name: "Networking", subdomains: &["tcp_ip", "dns", "http", "routing", "security", "wireless", "load_balancing"] },
-    DomainDef { category: "cs", name: "Databases", subdomains: &["relational", "nosql", "indexing", "transactions", "distributed", "query_optimization"] },
-    DomainDef { category: "cs", name: "Compilers", subdomains: &["lexing", "parsing", "ast", "code_gen", "optimization", "type_checking"] },
-    DomainDef { category: "cs", name: "Distributed Systems", subdomains: &["consensus", "replication", "partitioning", "cap_theorem", "mapreduce", "eventual_consistency"] },
-    DomainDef { category: "cs", name: "Machine Learning", subdomains: &["supervised", "unsupervised", "reinforcement", "neural_networks", "transformers", "evaluation"] },
-    DomainDef { category: "cs", name: "Cybersecurity", subdomains: &["cryptography", "network_security", "web_security", "reverse_engineering", "forensics", "malware_analysis"] },
-    DomainDef { category: "cs", name: "Software Engineering", subdomains: &["testing", "ci_cd", "design_patterns", "agile", "refactoring", "documentation"] },
-    DomainDef { category: "creative", name: "Fiction", subdomains: &["short_story", "flash_fiction", "dialogue", "worldbuilding", "character_dev", "plot_twist"] },
-    DomainDef { category: "creative", name: "Poetry", subdomains: &["sonnet", "free_verse", "haiku", "narrative", "spoken_word", "lyric"] },
-    DomainDef { category: "creative", name: "Screenwriting", subdomains: &["dialogue", "scene", "monologue", "plot_structure", "character_arc", "formatting"] },
-    DomainDef { category: "creative", name: "Journalism", subdomains: &["investigative", "feature", "opinion", "reporting", "interview", "editorial"] },
-    DomainDef { category: "creative", name: "Songwriting", subdomains: &["lyrics", "melody_description", "concept", "hook", "verse_chorus", "story_song"] },
-    DomainDef { category: "creative", name: "Game Narrative", subdomains: &["quest_design", "dialogue_trees", "lore", "cutscene", "branching_narrative", "environmental_storytelling"] },
-    DomainDef { category: "creative", name: "Copywriting", subdomains: &["ad_copy", "slogans", "product_descriptions", "email_marketing", "social_media", "brand_voice"] },
-    DomainDef { category: "creative", name: "Blogging", subdomains: &["how_to", "listicle", "opinion", "tutorial", "review", "personal_essay"] },
-    DomainDef { category: "conversation", name: "Debate", subdomains: &["formal", "casual", "philosophical", "scientific", "political", "ethical"] },
-    DomainDef { category: "conversation", name: "Advice", subdomains: &["career", "relationship", "academic", "financial", "health", "technical"] },
-    DomainDef { category: "conversation", name: "Interview", subdomains: &["job", "podcast", "journalistic", "research", "behavioral", "technical_interview"] },
-    DomainDef { category: "conversation", name: "Teaching", subdomains: &["socratic", "mentoring", "tutoring", "lecture_qa", "feedback", "study_guidance"] },
-    DomainDef { category: "conversation", name: "Roleplay", subdomains: &["historical_figure", "professional", "customer_service", "therapy", "negotiation", "collaborative"] },
-];
-
-const DEFAULT_DISTRIBUTION: &[(&str, f64)] = &[
-    ("math", 0.25),
-    ("coding", 0.25),
-    ("science", 0.15),
-    ("cs", 0.15),
-    ("creative", 0.10),
-    ("conversation", 0.10),
-];
-
-const DEFAULT_DIFFICULTY: &[(u8, f64)] = &[
-    (1, 0.05),
-    (2, 0.05),
-    (3, 0.10),
-    (4, 0.15),
-    (5, 0.20),
-    (6, 0.15),
-    (7, 0.10),
-    (8, 0.08),
-    (9, 0.07),
-    (10, 0.05),
-];
-
-fn difficulty_label(d: u8) -> &'static str {
-    match d {
-        1 => "Very Easy (child-level)",
-        2 => "Easy (elementary)",
-        3 => "Basic (middle school)",
-        4 => "Intermediate (high school)",
-        5 => "Standard (undergraduate intro)",
-        6 => "Skilled (undergraduate advanced)",
-        7 => "Proficient (graduate level)",
-        8 => "Advanced (professional/researcher)",
-        9 => "Expert (top specialist)",
-        10 => "Polymath (1-in-a-million genius)",
-        _ => "Unknown",
-    }
-}
-
-#[derive(Parser, Debug, Clone)]
-#[command(name = "taskgen", version, about = "SFT task generator for distillation datasets by empero-org")]
+#[derive(Debug, Parser)]
+#[command(name = "taskgen")]
 struct Args {
     #[arg(long, default_value = "https://api.openai.com/v1")]
     api_base: String,
@@ -152,10 +40,24 @@ struct Args {
     model: String,
 
     #[arg(long)]
-    system_prompt: Option<String>,
+    keyfile: Option<String>,
 
-    #[arg(short, long, default_value_t = 250)]
+    #[arg(long)]
+    input_price: Option<f64>,
+    #[arg(long)]
+    output_price: Option<f64>,
+
+    #[arg(short, long, default_value_t = 0.9)]
+    temperature: f64,
+
+    #[arg(short = 'c', long, default_value_t = 250)]
     count: usize,
+
+    #[arg(short, long, default_value = "output.jsonl")]
+    output: PathBuf,
+
+    #[arg(long)]
+    system_prompt: Option<String>,
 
     #[arg(long)]
     distribution: Option<String>,
@@ -163,26 +65,8 @@ struct Args {
     #[arg(long)]
     difficulty: Option<String>,
 
-    #[arg(short, long, default_value_t = 0.9)]
-    temperature: f64,
-
-    #[arg(short, long, default_value_t = 5)]
-    workers: usize,
-
-    #[arg(short, long, default_value = "output.jsonl")]
-    output: PathBuf,
-
     #[arg(long)]
-    append: bool,
-
-    #[arg(long)]
-    proxies: Option<PathBuf>,
-
-    #[arg(long)]
-    rotating_proxy: bool,
-
-    #[arg(long)]
-    keyfile: Option<PathBuf>,
+    seed: Option<u64>,
 
     #[arg(long)]
     dedup: bool,
@@ -198,30 +82,28 @@ struct Args {
     free_rescan: u64,
 
     #[arg(long)]
-    input_price: Option<f64>,
-
-    #[arg(long)]
-    output_price: Option<f64>,
-
-    #[arg(long)]
     budget: Option<f64>,
 
-    /// Generate tasks in multiple languages (en, de, fr, es, nl, zh, ar, ru)
+    #[arg(short = 'w', long, default_value_t = 5)]
+    workers: usize,
+
+    #[arg(long)]
+    append: bool,
+
+    #[arg(long)]
+    proxies: Option<PathBuf>,
+
+    #[arg(long)]
+    rotating_proxy: bool,
+
+    #[arg(long)]
+    lang: Option<String>,
+
     #[arg(long)]
     multilingual: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TaskEntry {
-    prompt: String,
-    domain: String,
-    subdomain: String,
-    difficulty: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
-    taskgen_model: String,
-    temperature: f64,
-}
+// ── API types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ChatRequest {
@@ -247,7 +129,6 @@ struct ChatResponse {
 struct Usage {
     prompt_tokens: u64,
     completion_tokens: u64,
-    total_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,179 +136,41 @@ struct Choice {
     message: ChatMessage,
 }
 
-const MAX_MODEL_FAILURES: usize = 3;
+// ── Error types ──────────────────────────────────────────────────────────────
 
-struct ModelFailures {
-    counts: std::sync::Mutex<HashMap<String, usize>>,
-    rescan_notify: tokio::sync::Notify,
+enum ApiError {
+    RateLimit(Option<u64>),
+    Billing(String),
+    Timeout,
+    Other(anyhow::Error),
 }
 
-impl ModelFailures {
-    fn new() -> Self {
-        Self {
-            counts: std::sync::Mutex::new(HashMap::new()),
-            rescan_notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    /// Record a failure. Returns true if the model just crossed the threshold.
-    fn record(&self, model: &str) -> bool {
-        let mut counts = self.counts.lock().unwrap();
-        let count = counts.entry(model.to_string()).or_insert(0);
-        *count += 1;
-        *count == MAX_MODEL_FAILURES
-    }
-
-    /// Remove a model from tracking (called after rescan replaces the list).
-    fn reset(&self) {
-        let mut counts = self.counts.lock().unwrap();
-        counts.clear();
-    }
-}
-
-struct AtomicStats {
-    input_tokens: AtomicU64,
-    output_tokens: AtomicU64,
-    tasks: AtomicUsize,
-    errors: AtomicUsize,
-}
-
-impl AtomicStats {
-    fn new() -> Self {
-        Self {
-            input_tokens: AtomicU64::new(0),
-            output_tokens: AtomicU64::new(0),
-            tasks: AtomicUsize::new(0),
-            errors: AtomicUsize::new(0),
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::RateLimit(s) => write!(f, "rate limited (retry after {:?}s)", s),
+            ApiError::Billing(msg) => write!(f, "billing error: {}", msg),
+            ApiError::Timeout => write!(f, "request timed out"),
+            ApiError::Other(e) => write!(f, "{}", e),
         }
     }
 }
 
-struct RunStats {
-    total_input_tokens: u64,
-    total_output_tokens: u64,
-    total_tasks: usize,
-    errors: usize,
+fn is_billing_error(status: reqwest::StatusCode, body: &str) -> bool {
+    if status.as_u16() == 402 {
+        return true;
+    }
+    let lower = body.to_lowercase();
+    lower.contains("insufficient_quota")
+        || lower.contains("billing")
+        || lower.contains("payment required")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("account is not active")
+        || lower.contains("insufficient_funds")
+        || lower.contains("budget")
 }
 
-fn parse_distribution(input: &str) -> Result<HashMap<String, f64>> {
-    let mut map = HashMap::new();
-    for pair in input.split(',') {
-        let pair = pair.trim();
-        let (key, val) = pair.split_once('=').context(format!("invalid distribution pair: {}", pair))?;
-        let key = key.trim().to_lowercase();
-        let val: f64 = val.trim().parse().context(format!("invalid weight: {}", val))?;
-        map.insert(key, val);
-    }
-    let total: f64 = map.values().sum();
-    if (total - 1.0).abs() > 0.05 {
-        bail!("distribution weights must sum to ~1.0, got {}", total);
-    }
-    let normalized: HashMap<String, f64> = map.into_iter().map(|(k, v)| (k, v / total)).collect();
-    Ok(normalized)
-}
-
-fn parse_difficulty(input: &str) -> Result<HashMap<u8, f64>> {
-    let mut map = HashMap::new();
-    for pair in input.split(',') {
-        let pair = pair.trim();
-        let (key, val) = pair.split_once('=').context(format!("invalid difficulty pair: {}", pair))?;
-        let key: String = key.trim().to_lowercase();
-        let d: u8 = if key.starts_with('d') {
-            key[1..].parse().context(format!("invalid difficulty level: {}", key))?
-        } else {
-            key.parse().context(format!("invalid difficulty level: {}", key))?
-        };
-        if !(1..=10).contains(&d) {
-            bail!("difficulty must be 1-10, got {}", d);
-        }
-        let val: f64 = val.trim().parse().context(format!("invalid weight: {}", val))?;
-        map.insert(d, val);
-    }
-    let total: f64 = map.values().sum();
-    if (total - 1.0).abs() > 0.05 {
-        bail!("difficulty weights must sum to ~1.0, got {}", total);
-    }
-    let normalized: HashMap<u8, f64> = map.into_iter().map(|(k, v)| (k, v / total)).collect();
-    Ok(normalized)
-}
-
-fn parse_proxy_line(line: &str) -> Result<reqwest::Proxy> {
-    let line = line.trim();
-    let parts: Vec<&str> = line.split(':').collect();
-    let proxy_url = match parts.len() {
-        2 => format!("http://{}:{}", parts[0], parts[1]),
-        4 => format!("http://{}:{}@{}:{}", parts[2], parts[3], parts[0], parts[1]),
-        _ => bail!("invalid proxy format '{}', expected host:port or host:port:user:pass", line),
-    };
-    reqwest::Proxy::all(&proxy_url).context(format!("failed to create proxy from '{}'", line))
-}
-
-fn load_proxies(path: &PathBuf) -> Result<Vec<reqwest::Proxy>> {
-    let file = File::open(path).context(format!("failed to open proxy file: {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut proxies = Vec::new();
-    for (i, line) in reader.lines().enumerate() {
-        let line = line.context("failed to read proxy file")?;
-        let line = line.trim().to_string();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        proxies.push(parse_proxy_line(&line).context(format!("proxy line {}", i + 1))?);
-    }
-    if proxies.is_empty() {
-        bail!("proxy file is empty: {}", path.display());
-    }
-    Ok(proxies)
-}
-
-fn build_clients(proxies: &[reqwest::Proxy]) -> Vec<reqwest::Client> {
-    proxies
-        .iter()
-        .map(|p| {
-            reqwest::Client::builder()
-                .proxy(p.clone())
-                .build()
-                .expect("failed to build client with proxy")
-        })
-        .collect()
-}
-
-fn word_trigrams(text: &str) -> HashSet<String> {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() < 3 {
-        return words.iter().map(|w| w.to_string()).collect();
-    }
-    words.windows(3).map(|w| w.join(" ")).collect()
-}
-
-fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    let intersection = a.intersection(b).count();
-    let union = a.union(b).count();
-    if union == 0 { return 0.0; }
-    intersection as f64 / union as f64
-}
-
-fn load_api_keys(path: &PathBuf) -> Result<Vec<String>> {
-    let file = File::open(path).context(format!("failed to open keyfile: {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut keys = Vec::new();
-    for line in reader.lines() {
-        let line = line.context("failed to read keyfile")?;
-        let line = line.trim().to_string();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        keys.push(line);
-    }
-    if keys.is_empty() {
-        bail!("keyfile is empty: {}", path.display());
-    }
-    Ok(keys)
-}
+// ── Free-model discovery (OpenRouter) ────────────────────────────────────────
 
 const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 const MIN_FREE_MODEL_CTX: u64 = 16000;
@@ -461,10 +204,9 @@ struct ModelPricing {
 #[derive(Debug, Deserialize)]
 struct ModelProvider {
     context_length: Option<u64>,
-    max_completion_tokens: Option<u64>,
 }
 
-async fn fetch_free_models(client: &reqwest::Client, api_key: &str) -> Result<Vec<String>> {
+async fn fetch_free_models(client: &reqwest::Client, api_key: &str) -> anyhow::Result<Vec<String>> {
     let url = format!("{}/models", OPENROUTER_API_BASE);
     let resp = client
         .get(&url)
@@ -475,7 +217,7 @@ async fn fetch_free_models(client: &reqwest::Client, api_key: &str) -> Result<Ve
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
-        bail!("OpenRouter models API error: {}", text);
+        anyhow::bail!("OpenRouter models API error: {}", text);
     }
 
     let models: ModelsResponse = resp.json().await.context("failed to parse models response")?;
@@ -497,16 +239,17 @@ async fn fetch_free_models(client: &reqwest::Client, api_key: &str) -> Result<Ve
         })
         .collect();
 
-    // sort by context length descending so best models are first
     free.sort_by(|a, b| b.2.cmp(&a.2));
 
     if free.is_empty() {
-        bail!("no free models with >= {}k context available on OpenRouter right now", MIN_FREE_MODEL_CTX / 1000);
+        anyhow::bail!(
+            "no free models with >= {}k context available on OpenRouter right now",
+            MIN_FREE_MODEL_CTX / 1000
+        );
     }
 
     println!("Found {} candidate free models, running health checks...", free.len());
 
-    // ping each model with a tiny request to verify it's actually online
     let mut verified: Vec<String> = Vec::new();
     for (id, name, ctx) in &free {
         print!("  testing {} ({}, {}k ctx)... ", id, name, ctx / 1000);
@@ -522,14 +265,14 @@ async fn fetch_free_models(client: &reqwest::Client, api_key: &str) -> Result<Ve
     }
 
     if verified.is_empty() {
-        bail!("all free models are offline on OpenRouter right now");
+        anyhow::bail!("all free models are offline on OpenRouter right now");
     }
 
     println!("Using {} verified free models", verified.len());
     Ok(verified)
 }
 
-async fn test_model(client: &reqwest::Client, api_key: &str, model: &str) -> Result<()> {
+async fn test_model(client: &reqwest::Client, api_key: &str, model: &str) -> anyhow::Result<()> {
     let body = ChatRequest {
         model: model.to_string(),
         messages: vec![ChatMessage {
@@ -552,88 +295,100 @@ async fn test_model(client: &reqwest::Client, api_key: &str, model: &str) -> Res
         .context("request failed")?;
 
     let status = resp.status();
-
-    // 429 means the model exists and is live, just rate limited — count as available
     if status.as_u16() == 429 {
         return Ok(());
     }
-
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        bail!("{}: {}", status, &text[..text.len().min(100)]);
+        anyhow::bail!("{}: {}", status, &text[..text.len().min(100)]);
     }
-
     let chat_resp: ChatResponse = resp.json().await.context("bad response")?;
     if chat_resp.choices.is_empty() {
-        bail!("no choices returned");
+        anyhow::bail!("no choices returned");
     }
-
     Ok(())
 }
 
-fn build_domain_pool(dist: &HashMap<String, f64>) -> Vec<(String, String, String, f64)> {
-    let mut pool = Vec::new();
-    for (cat, &weight) in dist {
-        let domains_in_cat: Vec<&DomainDef> = DOMAINS.iter().filter(|d| d.category == cat).collect();
-        if domains_in_cat.is_empty() {
+// ── Per-model failure tracking ────────────────────────────────────────────────
+
+const MAX_MODEL_FAILURES: usize = 3;
+
+struct ModelFailures {
+    counts: std::sync::Mutex<HashMap<String, usize>>,
+    rescan_notify: tokio::sync::Notify,
+}
+
+impl ModelFailures {
+    fn new() -> Self {
+        Self {
+            counts: std::sync::Mutex::new(HashMap::new()),
+            rescan_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn record(&self, model: &str) -> bool {
+        let mut counts = self.counts.lock().unwrap();
+        let count = counts.entry(model.to_string()).or_insert(0);
+        *count += 1;
+        *count == MAX_MODEL_FAILURES
+    }
+
+    fn reset(&self) {
+        self.counts.lock().unwrap().clear();
+    }
+}
+
+// ── Proxy helpers ─────────────────────────────────────────────────────────────
+
+fn parse_proxy_line(line: &str) -> anyhow::Result<reqwest::Proxy> {
+    let line = line.trim();
+    let parts: Vec<&str> = line.split(':').collect();
+    let proxy_url = match parts.len() {
+        2 => format!("http://{}:{}", parts[0], parts[1]),
+        4 => format!("http://{}:{}@{}:{}", parts[2], parts[3], parts[0], parts[1]),
+        _ => anyhow::bail!(
+            "invalid proxy format '{}', expected host:port or host:port:user:pass",
+            line
+        ),
+    };
+    reqwest::Proxy::all(&proxy_url)
+        .context(format!("failed to create proxy from '{}'", line))
+}
+
+fn load_proxies(path: &PathBuf) -> anyhow::Result<Vec<reqwest::Proxy>> {
+    use std::io::BufRead;
+    let file = File::open(path).context(format!("failed to open proxy file: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut proxies = Vec::new();
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.context("failed to read proxy file")?;
+        let line = line.trim().to_string();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let per_domain = weight / domains_in_cat.len() as f64;
-        for d in &domains_in_cat {
-            for &sub in d.subdomains {
-                pool.push((cat.to_string(), d.name.to_string(), sub.to_string(), per_domain / d.subdomains.len() as f64));
-            }
-        }
+        proxies.push(parse_proxy_line(&line).context(format!("proxy line {}", i + 1))?);
     }
-    pool
-}
-
-fn sample_domain(rng: &mut impl Rng, pool: &[(String, String, String, f64)]) -> (String, String, String) {
-    let weights: Vec<f64> = pool.iter().map(|(_, _, _, w)| *w).collect();
-    let idx = WeightedIndex::new(&weights).unwrap();
-    let i = idx.sample(rng);
-    let (cat, name, sub, _) = &pool[i];
-    (cat.clone(), name.clone(), sub.clone())
-}
-
-fn sample_difficulty(rng: &mut impl Rng, dist: &HashMap<u8, f64>) -> u8 {
-    let levels: Vec<u8> = dist.keys().copied().collect();
-    let weights: Vec<f64> = levels.iter().map(|l| dist[l]).collect();
-    let idx = WeightedIndex::new(&weights).unwrap();
-    levels[idx.sample(rng)]
-}
-
-enum ApiError {
-    RateLimit(Option<u64>),
-    Billing(String),
-    Timeout,
-    Other(anyhow::Error),
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::RateLimit(s) => write!(f, "rate limited (retry after {:?}s)", s),
-            ApiError::Billing(msg) => write!(f, "billing error: {}", msg),
-            ApiError::Timeout => write!(f, "request timed out"),
-            ApiError::Other(e) => write!(f, "{}", e),
-        }
+    if proxies.is_empty() {
+        anyhow::bail!("proxy file is empty: {}", path.display());
     }
+    Ok(proxies)
 }
 
-fn is_billing_error(status: reqwest::StatusCode, body: &str) -> bool {
-    if status.as_u16() == 402 {
-        return true;
-    }
-    let lower = body.to_lowercase();
-    lower.contains("insufficient_quota")
-        || lower.contains("billing")
-        || lower.contains("payment required")
-        || lower.contains("exceeded your current quota")
-        || lower.contains("account is not active")
-        || lower.contains("insufficient_funds")
-        || lower.contains("budget")
+fn build_clients(proxies: &[reqwest::Proxy]) -> Vec<reqwest::Client> {
+    proxies
+        .iter()
+        .map(|p| {
+            reqwest::Client::builder()
+                .proxy(p.clone())
+                .build()
+                .expect("failed to build client with proxy")
+        })
+        .collect()
 }
+
+// ── Core API call ─────────────────────────────────────────────────────────────
+
+const MAX_RETRIES: u32 = 5;
 
 async fn api_request(
     client: &reqwest::Client,
@@ -697,15 +452,12 @@ async fn api_request(
     Ok((prompt_text, input_tokens, output_tokens))
 }
 
-const MAX_RETRIES: u32 = 5;
-
 async fn generate_task(
     client: &reqwest::Client,
     api_base: &str,
     api_key: &str,
     model: &str,
     system_prompt: &str,
-    _category: &str,
     domain_display: &str,
     subdomain: &str,
     difficulty: u8,
@@ -717,17 +469,22 @@ async fn generate_task(
 ) -> std::result::Result<(String, u64, u64), ApiError> {
     let lang_instruction = match language {
         Some(code) if code != "en" => {
-            let lang_name = LANGUAGES.iter().find(|(c, _)| *c == code).map(|(_, n)| *n).unwrap_or("English");
-            format!("\n\nIMPORTANT: Write the entire task/prompt in {}. Do NOT use English.", lang_name)
+            let lang_name = LANGUAGES
+                .iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, n)| *n)
+                .unwrap_or("English");
+            format!(
+                "\n\nIMPORTANT: Write the entire task/prompt in {}. Do NOT use English.",
+                lang_name
+            )
         }
         _ => String::new(),
     };
 
     let user_msg = format!(
-        "Generate a task/prompt for the following:\n\nDomain: {}\nSubdomain: {}\nDifficulty: {}/10 ({})\n\nThe task MUST be directly and specifically about the subdomain \"{}\" within {}. Do NOT generate a generic {} task — the content must focus on {} specifically.\n\nOutput only the task prompt, nothing else.{}",
-        domain_display, subdomain, difficulty, difficulty_label(difficulty),
-        subdomain, domain_display, domain_display, subdomain,
-        lang_instruction
+        "Generate a task/prompt for the following:\n\nDomain: {}\nSubdomain: {}\nDifficulty: {}/10\n\nOutput only the task prompt, nothing else.{}",
+        domain_display, subdomain, difficulty, lang_instruction
     );
 
     let body = ChatRequest {
@@ -779,7 +536,10 @@ async fn generate_task(
                 }
                 let wait = 2u64.pow(retries).min(30);
                 pb.suspend(|| {
-                    eprintln!("[TIMEOUT] request timed out, waiting {}s (retry {}/{}, {} consecutive)", wait, retries, MAX_RETRIES, count);
+                    eprintln!(
+                        "[TIMEOUT] request timed out, waiting {}s (retry {}/{}, {} consecutive)",
+                        wait, retries, MAX_RETRIES, count
+                    );
                 });
                 tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
             }
@@ -795,139 +555,79 @@ async fn generate_task(
     }
 }
 
-fn count_existing_tasks(path: &PathBuf) -> usize {
-    if !path.exists() {
-        return 0;
+// ── Misc helpers ──────────────────────────────────────────────────────────────
+
+fn parse_distribution(s: &str) -> HashMap<String, f64> {
+    let mut map = HashMap::new();
+    for part in s.split(',') {
+        let kv: Vec<&str> = part.trim().split(':').collect();
+        if kv.len() == 2 {
+            let domain = kv[0].trim();
+            let weight: f64 = kv[1].trim().parse().unwrap_or(1.0);
+            map.insert(domain.to_string(), weight);
+        }
     }
-    let file = File::open(path).ok();
-    match file {
-        Some(f) => BufReader::new(f).lines().filter_map(|l| l.ok()).filter(|l| !l.trim().is_empty()).count(),
-        None => 0,
+    if map.is_empty() {
+        for d in DOMAINS {
+            map.insert(d.name.to_string(), 1.0);
+        }
+    }
+    map
+}
+
+fn parse_difficulty(s: &str) -> HashMap<u8, f64> {
+    let mut map = HashMap::new();
+    for part in s.split(',') {
+        let kv: Vec<&str> = part.trim().split(':').collect();
+        if kv.len() == 2 {
+            let level: u8 = kv[0].trim().parse().unwrap_or(5);
+            let weight: f64 = kv[1].trim().parse().unwrap_or(1.0);
+            map.insert(level, weight);
+        }
+    }
+    map
+}
+
+fn sample_subdomains(rng: &mut impl Rng) -> (String, String, String) {
+    let domain = &DOMAINS[rng.gen_range(0..DOMAINS.len())];
+    let cat = domain.category.to_string();
+    let name = domain.name.to_string();
+    let sub = domain.subdomains[rng.gen_range(0..domain.subdomains.len())].to_string();
+    (cat, name, sub)
+}
+
+fn count_existing_tasks(path: &PathBuf) -> usize {
+    match File::open(path) {
+        Ok(f) => BufReader::new(f).lines().filter_map(|l| l.ok()).filter(|l| !l.trim().is_empty()).count(),
+        Err(_) => 0,
     }
 }
 
-fn generate_readme(
-    args: &Args,
-    stats: &RunStats,
-    dist: &HashMap<String, f64>,
-    diff_dist: &HashMap<u8, f64>,
-    lang_counts: Option<&HashMap<String, usize>>,
-) -> String {
-    let input_cost = args.input_price.map(|p| p * stats.total_input_tokens as f64 / 1_000_000.0);
-    let output_cost = args.output_price.map(|p| p * stats.total_output_tokens as f64 / 1_000_000.0);
-    let total_cost = match (input_cost, output_cost) {
-        (Some(i), Some(o)) => Some(i + o),
-        _ => None,
-    };
-
-    let mut md = String::new();
-
-    md.push_str("# TaskGen Dataset\n\n");
-    md.push_str("> Generated with **taskgen** by [empero-org](https://github.com/empero-org)\n\n");
-
-    md.push_str("## Run Parameters\n\n");
-    md.push_str("| Parameter | Value |\n|---|---|\n");
-    md.push_str(&format!("| Model | `{}` |\n", args.model));
-    md.push_str(&format!("| Temperature | `{}` |\n", args.temperature));
-    md.push_str(&format!("| Total Tasks | {} |\n", stats.total_tasks));
-    md.push_str(&format!("| Concurrency | {} workers |\n", args.workers));
-    md.push_str(&format!("| API Base | `{}` |\n", args.api_base));
-    md.push_str(&format!("| Generated | {} |\n", Local::now().format("%Y-%m-%d %H:%M:%S")));
-    if let Some(b) = args.budget {
-        md.push_str(&format!("| Budget Cap | ${:.4} |\n", b));
+fn word_trigrams(text: &str) -> HashSet<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut trigrams = HashSet::new();
+    for window in words.windows(3) {
+        trigrams.insert(window.join(" "));
     }
-    if args.multilingual {
-        md.push_str("| Multilingual | Yes (en, de, fr, es, nl, zh, ar, ru) |\n");
-    }
-    md.push('\n');
+    trigrams
+}
 
-    if let Some(counts) = lang_counts {
-        md.push_str("## Language Distribution\n\n");
-        md.push_str("| Language | Code | Tasks |\n|---|---|---|\n");
-        let mut sorted: Vec<_> = counts.iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(a.1));
-        for (code, count) in &sorted {
-            let name = LANGUAGES.iter().find(|(c, _)| *c == code.as_str()).map(|(_, n)| *n).unwrap_or("Unknown");
-            md.push_str(&format!("| {} | `{}` | {} |\n", name, code, count));
-        }
-        md.push('\n');
+fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 0.0;
     }
-
-    md.push_str("## Domain Distribution\n\n");
-    md.push_str("| Domain | Weight |\n|---|---|\n");
-    let mut sorted_cats: Vec<_> = dist.iter().collect();
-    sorted_cats.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
-    for (cat, w) in &sorted_cats {
-        md.push_str(&format!("| {} | {:.1}% |\n", cat, **w * 100.0));
-    }
-    md.push('\n');
-
-    md.push_str("## Difficulty Distribution\n\n");
-    md.push_str("| Level | Label | Weight |\n|---|---|---|\n");
-    for d in 1..=10u8 {
-        if let Some(w) = diff_dist.get(&d) {
-            md.push_str(&format!("| {} | {} | {:.1}% |\n", d, difficulty_label(d), w * 100.0));
-        }
-    }
-    md.push('\n');
-
-    md.push_str("## Token Usage & Cost\n\n");
-    md.push_str("| Metric | Value |\n|---|---|\n");
-    md.push_str(&format!("| Input Tokens | {} |\n", stats.total_input_tokens));
-    md.push_str(&format!("| Output Tokens | {} |\n", stats.total_output_tokens));
-    md.push_str(&format!("| Total Tokens | {} |\n", stats.total_input_tokens + stats.total_output_tokens));
-    md.push_str(&format!("| Errors | {} |\n", stats.errors));
-    if let Some(ic) = input_cost {
-        md.push_str(&format!("| Input Cost | ${:.6} |\n", ic));
-    }
-    if let Some(oc) = output_cost {
-        md.push_str(&format!("| Output Cost | ${:.6} |\n", oc));
-    }
-    if let Some(tc) = total_cost {
-        md.push_str(&format!("| **Total Cost** | **${:.6}** |\n", tc));
-    }
-    if args.input_price.is_none() && args.output_price.is_none() {
-        md.push_str("| Cost | *Not calculated (use --input-price and --output-price per M tokens)* |\n");
-    }
-    md.push('\n');
-
-    md.push_str("## Output Format\n\n");
-    md.push_str("Each line in the JSONL file contains:\n\n");
-    md.push_str("```json\n");
-    md.push_str("{\n");
-    md.push_str("  \"prompt\": \"...\",\n");
-    md.push_str("  \"domain\": \"math::Algebra\",\n");
-    md.push_str("  \"subdomain\": \"polynomials\",\n");
-    md.push_str("  \"difficulty\": 5,\n");
-    if args.multilingual {
-        md.push_str("  \"language\": \"en\",\n");
-    }
-    md.push_str("  \"taskgen_model\": \"gpt-4o-mini\",\n");
-    md.push_str("  \"temperature\": 0.9\n");
-    md.push_str("}\n");
-    md.push_str("```\n\n");
-
-    md.push_str("## Support / Donate\n\n");
-    md.push_str("If this tool helped you, consider supporting the project:\n\n");
-    md.push_str(&format!("- **BTC**: `{}`\n", DONATION_BTC));
-    md.push_str(&format!("- **LTC**: `{}`\n", DONATION_LTC));
-    md.push_str(&format!("- **XMR**: `{}`\n\n", DONATION_XMR));
-
-    md.push_str("---\n\n");
-    md.push_str("*Built with [taskgen](https://github.com/empero-org/taskgen) by empero-org*\n");
-
-    md
+    let intersection = a.intersection(b).count();
+    let union = a.union(b).count();
+    intersection as f64 / union as f64
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
     let api_keys: Arc<Vec<String>> = Arc::new(match &args.keyfile {
-        Some(path) => {
-            let keys = load_api_keys(path)?;
-            println!("Loaded {} API keys (round-robin)", keys.len());
-            keys
+        Some(kf) => {
+            let content = std::fs::read_to_string(kf)?;
+            content.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
         }
         None => {
             let key = args.api_key.clone().context("API key required. Use --api-key, set OPENAI_API_KEY, or use --keyfile")?;
@@ -936,7 +636,6 @@ async fn main() -> Result<()> {
     });
     let key_counter = Arc::new(AtomicUsize::new(0));
 
-    // discover free models from OpenRouter if requested
     let api_base = if args.free_models {
         OPENROUTER_API_BASE.to_string()
     } else {
@@ -954,23 +653,29 @@ async fn main() -> Result<()> {
     };
     let model_counter = Arc::new(AtomicUsize::new(0));
 
-    let dist: HashMap<String, f64> = match &args.distribution {
-        Some(d) => parse_distribution(d)?,
-        None => DEFAULT_DISTRIBUTION.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+    let dist = match &args.distribution {
+        Some(d) => parse_distribution(d),
+        None => {
+            let mut m = HashMap::new();
+            for domain in DOMAINS {
+                m.insert(domain.name.to_string(), 1.0);
+            }
+            m
+        }
     };
 
-    let diff_dist: HashMap<u8, f64> = match &args.difficulty {
-        Some(d) => parse_difficulty(d)?,
-        None => DEFAULT_DIFFICULTY.iter().map(|(k, v)| (*k, *v)).collect(),
+    let diff_dist = match &args.difficulty {
+        Some(d) => parse_difficulty(d),
+        None => {
+            let mut m = HashMap::new();
+            for i in 1..=10 {
+                m.insert(i, 1.0);
+            }
+            m
+        }
     };
 
-    let pool = build_domain_pool(&dist);
-    if pool.is_empty() {
-        bail!("no domains matched the given distribution. Available categories: math, coding, science, cs, creative, conversation");
-    }
-
-    let system_prompt = args.system_prompt.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT);
-
+    let custom_prompt = args.system_prompt.clone();
     let existing = if args.append { count_existing_tasks(&args.output) } else { 0 };
     if existing > 0 {
         println!("Appending to existing file with {} tasks", existing);
@@ -982,6 +687,7 @@ async fn main() -> Result<()> {
         File::create(&args.output)?
     };
 
+    // Build HTTP clients (with optional proxy support)
     let clients: Arc<Vec<reqwest::Client>> = Arc::new(match &args.proxies {
         Some(proxy_path) => {
             let proxies = load_proxies(proxy_path)?;
@@ -1001,8 +707,8 @@ async fn main() -> Result<()> {
     });
     let proxy_counter = Arc::new(AtomicUsize::new(0));
 
+    let stats = Arc::new(Stats::new());
     let file = Arc::new(std::sync::Mutex::new(file));
-    let stats = Arc::new(AtomicStats::new());
     let cancel = Arc::new(AtomicBool::new(false));
     let consecutive_timeouts = Arc::new(AtomicUsize::new(0));
 
@@ -1012,23 +718,28 @@ async fn main() -> Result<()> {
     let count = args.count;
     let workers = args.workers;
 
-    // pre-sample all domain/difficulty/language tuples to avoid RNG contention in workers
+    // Pre-sample all (domain, difficulty, language) tuples up front to avoid
+    // RNG contention inside the concurrent workers.
     let mut rng = thread_rng();
     let multilingual = args.multilingual;
     let presampled: Vec<(String, String, String, u8, Option<String>)> = (0..count)
         .map(|_| {
-            let (cat, name, sub) = sample_domain(&mut rng, &pool);
-            let diff = sample_difficulty(&mut rng, &diff_dist);
+            let (cat, name, sub) = sample_subdomains(&mut rng);
+            let diff = loop {
+                let level: u8 = rng.gen_range(1..=10);
+                if diff_dist.contains_key(&level) {
+                    break level;
+                }
+            };
             let lang = if multilingual {
                 let idx = rng.gen_range(0..LANGUAGES.len());
                 Some(LANGUAGES[idx].0.to_string())
             } else {
-                None
+                args.lang.clone()
             };
             (cat, name, sub, diff, lang)
         })
         .collect();
-
     let presampled = Arc::new(presampled);
 
     let pb = ProgressBar::new(count as u64);
@@ -1040,7 +751,7 @@ async fn main() -> Result<()> {
     );
     pb.set_message("starting...");
 
-    // spawn background rescan task for free models
+    // Background task: periodically refresh the free-model list.
     let rescan_handle = if let Some(ref model_list) = free_model_list {
         let model_list = model_list.clone();
         let cancel = cancel.clone();
@@ -1051,7 +762,6 @@ async fn main() -> Result<()> {
         Some(tokio::spawn(async move {
             let client = reqwest::Client::new();
             loop {
-                // wait for either the timer or an immediate rescan trigger
                 tokio::select! {
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(rescan_mins * 60)) => {},
                     _ = model_failures.rescan_notify.notified() => {},
@@ -1062,11 +772,10 @@ async fn main() -> Result<()> {
                 pb.suspend(|| println!("[RESCAN] refreshing free model list..."));
                 match fetch_free_models(&client, &api_key).await {
                     Ok(new_models) => {
-                        let count = new_models.len();
+                        let n = new_models.len();
                         model_failures.reset();
-                        let mut list = model_list.write().await;
-                        *list = new_models;
-                        pb.suspend(|| println!("[RESCAN] updated: {} models available", count));
+                        *model_list.write().await = new_models;
+                        pb.suspend(|| println!("[RESCAN] updated: {} models available", n));
                     }
                     Err(e) => {
                         pb.suspend(|| eprintln!("[RESCAN] failed to refresh: {}, keeping current list", e));
@@ -1078,149 +787,147 @@ async fn main() -> Result<()> {
         None
     };
 
-    stream::iter(0..count)
-        .for_each_concurrent(workers, |i| {
-            let clients = clients.clone();
-            let proxy_counter = proxy_counter.clone();
-            let file = file.clone();
-            let stats = stats.clone();
-            let cancel = cancel.clone();
-            let consecutive_timeouts = consecutive_timeouts.clone();
-            let api_base = api_base.clone();
-            let api_keys = api_keys.clone();
-            let key_counter = key_counter.clone();
-            let model = args.model.clone();
-            let free_model_list = free_model_list.clone();
-            let model_counter = model_counter.clone();
-            let model_failures = model_failures.clone();
-            let system_prompt = system_prompt.to_string();
-            let presampled = presampled.clone();
-            let temperature = args.temperature;
-            let pb = pb.clone();
+    stream::iter(0..count).for_each_concurrent(workers, |i| {
+        let clients = clients.clone();
+        let proxy_counter = proxy_counter.clone();
+        let api_keys = api_keys.clone();
+        let key_counter = key_counter.clone();
+        let api_base = api_base.clone();
+        let stats = stats.clone();
+        let cancel = cancel.clone();
+        let consecutive_timeouts = consecutive_timeouts.clone();
+        let free_model_list = free_model_list.clone();
+        let model_counter = model_counter.clone();
+        let model_failures = model_failures.clone();
+        let pb = pb.clone();
+        let custom_prompt = custom_prompt.clone();
+        let model = args.model.clone();
+        let temperature = args.temperature;
+        let file = file.clone();
+        let presampled = presampled.clone();
 
-            async move {
-                if cancel.load(Ordering::Relaxed) {
+        async move {
+            if cancel.load(Ordering::Relaxed) {
+                pb.inc(1);
+                return;
+            }
+
+            let (ref cat, ref domain_name, ref subdomain, difficulty, ref lang) = presampled[i];
+
+            // Budget guard
+            if let (Some(b), Some(ip), Some(op)) = (budget, input_price, output_price) {
+                let in_tok = stats.input_tokens.load(Ordering::Relaxed) as f64;
+                let out_tok = stats.output_tokens.load(Ordering::Relaxed) as f64;
+                if (ip * in_tok / 1_000_000.0) + (op * out_tok / 1_000_000.0) >= b {
+                    cancel.store(true, Ordering::Relaxed);
                     pb.inc(1);
                     return;
                 }
+            }
 
-                let (ref cat, ref domain_name, ref subdomain, difficulty, ref lang) = presampled[i];
+            let use_model = match &free_model_list {
+                Some(models) => {
+                    let list = models.read().await;
+                    let idx = model_counter.fetch_add(1, Ordering::Relaxed) % list.len();
+                    list[idx].clone()
+                }
+                None => model.clone(),
+            };
 
-                if let (Some(b), Some(ip), Some(op)) = (budget, input_price, output_price) {
-                    let in_tok = stats.input_tokens.load(Ordering::Relaxed) as f64;
-                    let out_tok = stats.output_tokens.load(Ordering::Relaxed) as f64;
-                    let cost = (ip * in_tok / 1_000_000.0) + (op * out_tok / 1_000_000.0);
-                    if cost >= b {
-                        cancel.store(true, Ordering::Relaxed);
+            let domain_display = format!("{}::{}", cat, domain_name);
+            let client_idx = proxy_counter.fetch_add(1, Ordering::Relaxed) % clients.len();
+            let client = &clients[client_idx];
+            let key_idx = key_counter.fetch_add(1, Ordering::Relaxed) % api_keys.len();
+            let api_key = &api_keys[key_idx];
+
+            let system_prompt: String = match custom_prompt.as_ref() {
+                Some(p) => p.clone(),
+                None => build_system_prompt(lang.as_deref()),
+            };
+
+            match generate_task(
+                client,
+                &api_base,
+                api_key,
+                &use_model,
+                &system_prompt,
+                &domain_display,
+                subdomain,
+                difficulty,
+                temperature,
+                lang.as_deref(),
+                &cancel,
+                &consecutive_timeouts,
+                &pb,
+            )
+            .await
+            {
+                Ok((prompt_text, in_tok, out_tok)) => {
+                    if prompt_text.trim().is_empty() {
+                        stats.errors.fetch_add(1, Ordering::Relaxed);
                         pb.inc(1);
                         return;
                     }
-                }
-
-                let use_model = match &free_model_list {
-                    Some(models) => {
-                        let list = models.read().await;
-                        let idx = model_counter.fetch_add(1, Ordering::Relaxed) % list.len();
-                        list[idx].clone()
+                    let entry = TaskEntry {
+                        prompt: prompt_text,
+                        domain: domain_display,
+                        subdomain: subdomain.clone(),
+                        difficulty,
+                        language: lang.clone(),
+                    };
+                    let line = serde_json::to_string(&entry).unwrap() + "\n";
+                    {
+                        let mut f = file.lock().unwrap();
+                        let _ = f.write_all(line.as_bytes());
+                        let _ = f.flush();
                     }
-                    None => model.clone(),
-                };
-
-                let domain_display = format!("{}::{}", cat, domain_name);
-                let client_idx = proxy_counter.fetch_add(1, Ordering::Relaxed) % clients.len();
-                let client = &clients[client_idx];
-                let key_idx = key_counter.fetch_add(1, Ordering::Relaxed) % api_keys.len();
-                let api_key = &api_keys[key_idx];
-
-                match generate_task(
-                    client,
-                    &api_base,
-                    api_key,
-                    &use_model,
-                    &system_prompt,
-                    cat,
-                    &domain_display,
-                    subdomain,
-                    difficulty,
-                    temperature,
-                    lang.as_deref(),
-                    &cancel,
-                    &consecutive_timeouts,
-                    &pb,
-                )
-                .await
-                {
-                    Ok((prompt, in_tok, out_tok)) => {
-                        if prompt.trim().is_empty() {
-                            stats.errors.fetch_add(1, Ordering::Relaxed);
-                            pb.inc(1);
-                            return;
-                        }
-                        let entry = TaskEntry {
-                            prompt,
-                            domain: format!("{}::{}", cat, domain_name),
-                            subdomain: subdomain.clone(),
-                            difficulty,
-                            language: lang.clone(),
-                            taskgen_model: use_model,
-                            temperature,
-                        };
-                        let line = serde_json::to_string(&entry).unwrap() + "\n";
-                        {
-                            let mut f = file.lock().unwrap();
-                            let _ = f.write_all(line.as_bytes());
-                            let _ = f.flush();
-                        }
-                        stats.input_tokens.fetch_add(in_tok, Ordering::Relaxed);
-                        stats.output_tokens.fetch_add(out_tok, Ordering::Relaxed);
-                        let done = stats.tasks.fetch_add(1, Ordering::Relaxed) + 1;
-                        let errs = stats.errors.load(Ordering::Relaxed);
-                        let cur_in = stats.input_tokens.load(Ordering::Relaxed) as f64;
-                        let cur_out = stats.output_tokens.load(Ordering::Relaxed) as f64;
-                        let total_tok = (cur_in + cur_out) as u64;
-                        let cost_str = match (input_price, output_price) {
-                            (Some(ip), Some(op)) => {
-                                let cost = (ip * cur_in / 1_000_000.0) + (op * cur_out / 1_000_000.0);
-                                if let Some(b) = budget {
-                                    if cost >= b {
-                                        cancel.store(true, Ordering::Relaxed);
-                                    }
+                    stats.input_tokens.fetch_add(in_tok, Ordering::Relaxed);
+                    stats.output_tokens.fetch_add(out_tok, Ordering::Relaxed);
+                    let done = stats.tasks.fetch_add(1, Ordering::Relaxed) + 1;
+                    let errs = stats.errors.load(Ordering::Relaxed);
+                    let cur_in = stats.input_tokens.load(Ordering::Relaxed) as f64;
+                    let cur_out = stats.output_tokens.load(Ordering::Relaxed) as f64;
+                    let total_tok = (cur_in + cur_out) as u64;
+                    let cost_str = match (input_price, output_price) {
+                        (Some(ip), Some(op)) => {
+                            let cost = (ip * cur_in / 1_000_000.0) + (op * cur_out / 1_000_000.0);
+                            if let Some(b) = budget {
+                                if cost >= b {
+                                    cancel.store(true, Ordering::Relaxed);
                                 }
-                                format!(" | ${:.4}", cost)
                             }
-                            _ => String::new(),
-                        };
-                        pb.set_message(format!(
-                            "{} ok | {} err | {}k tok{}",
-                            done, errs, total_tok / 1000, cost_str
-                        ));
-                    }
-                    Err(e) => {
-                        stats.errors.fetch_add(1, Ordering::Relaxed);
-                        if !cancel.load(Ordering::Relaxed) {
-                            pb.suspend(|| eprintln!("[ERROR] task {}: {}", i + 1, e));
+                            format!(" | ${:.4}", cost)
                         }
-                        // track per-model failures for free model rotation
-                        if free_model_list.is_some() {
-                            let tripped = model_failures.record(&use_model);
-                            if tripped {
-                                pb.suspend(|| {
-                                    eprintln!(
-                                        "[RESCAN] {} failed {} times, marking offline and triggering rescan",
-                                        use_model, MAX_MODEL_FAILURES
-                                    );
-                                });
-                                model_failures.rescan_notify.notify_one();
-                            }
+                        _ => String::new(),
+                    };
+                    pb.set_message(format!(
+                        "{} ok | {} err | {}k tok{}",
+                        done, errs, total_tok / 1000, cost_str
+                    ));
+                }
+                Err(e) => {
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                    if !cancel.load(Ordering::Relaxed) {
+                        pb.suspend(|| eprintln!("[ERROR] task {}: {}", i + 1, e));
+                    }
+                    if free_model_list.is_some() {
+                        let tripped = model_failures.record(&use_model);
+                        if tripped {
+                            pb.suspend(|| {
+                                eprintln!(
+                                    "[RESCAN] {} failed {} times, marking offline and triggering rescan",
+                                    use_model, MAX_MODEL_FAILURES
+                                );
+                            });
+                            model_failures.rescan_notify.notify_one();
                         }
                     }
                 }
-                pb.inc(1);
             }
-        })
-        .await;
+            pb.inc(1);
+        }
+    }).await;
 
-    // stop the rescan task
     if let Some(handle) = rescan_handle {
         handle.abort();
     }
@@ -1232,10 +939,10 @@ async fn main() -> Result<()> {
         pb.finish_with_message("done");
     }
 
-    let total_tasks = stats.tasks.load(Ordering::Relaxed);
     let total_errors = stats.errors.load(Ordering::Relaxed);
     let total_in = stats.input_tokens.load(Ordering::Relaxed);
     let total_out = stats.output_tokens.load(Ordering::Relaxed);
+    let total_tasks = stats.tasks.load(Ordering::Relaxed);
 
     if was_cancelled {
         println!("\nGraceful shutdown — saved {} tasks before exit", total_tasks);
@@ -1243,7 +950,10 @@ async fn main() -> Result<()> {
     println!("Generated {} tasks ({} errors)", total_tasks, total_errors);
     println!("Tokens: {} in / {} out", total_in, total_out);
 
-    let stats = RunStats {
+    println!("Generated {} tasks ({} errors)", total_tasks, total_errors);
+    println!("Tokens: {} in / {} out", total_in, total_out);
+
+    let run_stats = RunStats {
         total_input_tokens: total_in,
         total_output_tokens: total_out,
         total_tasks,
@@ -1263,7 +973,6 @@ async fn main() -> Result<()> {
             lines.push(line);
         }
 
-        // pass 1: exact duplicates
         let mut seen: HashSet<String> = HashSet::new();
         let mut keep = vec![true; lines.len()];
         let mut exact_dupes = 0usize;
@@ -1282,7 +991,6 @@ async fn main() -> Result<()> {
             println!("Removed {} exact duplicates", exact_dupes);
         }
 
-        // pass 2: semantic duplicates via word-trigram jaccard
         let kept_indices: Vec<usize> = (0..lines.len()).filter(|&i| keep[i]).collect();
         let trigrams: Vec<Option<HashSet<String>>> = kept_indices
             .iter()
@@ -1338,8 +1046,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // split output into per-language files when --multilingual is set
-    let lang_counts: Option<HashMap<String, usize>> = if multilingual && args.output.exists() {
+    let lang_counts: Option<HashMap<String, usize>> = if args.multilingual && args.output.exists() {
         println!("\nSplitting output by language...");
         let reader = BufReader::new(File::open(&args.output)?);
         let mut lang_buckets: HashMap<String, Vec<String>> = HashMap::new();
@@ -1373,7 +1080,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let readme = generate_readme(&args, &stats, &dist, &diff_dist, lang_counts.as_ref());
+    let readme = generate_readme(&args, &run_stats, &dist, &diff_dist, lang_counts.as_ref());
     let readme_path = args.output.parent().unwrap_or(std::path::Path::new(".")).join("README.md");
     let mut rf = File::create(&readme_path).context("failed to create README.md")?;
     rf.write_all(readme.as_bytes())?;
